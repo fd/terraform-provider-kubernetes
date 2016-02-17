@@ -31,9 +31,10 @@ func Provider() terraform.ResourceProvider {
 			},
 		},
 		ResourcesMap: map[string]*schema.Resource{
-			"kubernetes_namespace": namespaceResource(),
-			"kubernetes_secret":    secretsResource(),
-			// "kubernetes_resource_controller": rcResource(),
+			"kubernetes_namespace":              namespaceResource(),
+			"kubernetes_secret":                 secretsResource(),
+			"kubernetes_service":                serviceResource(),
+			"kubernetes_replication_controller": replicationControllerResource(),
 		},
 		ConfigureFunc: func(r *schema.ResourceData) (interface{}, error) {
 

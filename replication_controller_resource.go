@@ -1538,8 +1538,8 @@ func writePodContainer(m map[string]interface{}, item *api.Container) error {
 	}
 
 	if n, ok := extractSingleMap(m["readiness_probe"]); ok {
-		item.LivenessProbe = &api.Probe{}
-		writeProbe(n, item.LivenessProbe)
+		item.ReadinessProbe = &api.Probe{}
+		writeProbe(n, item.ReadinessProbe)
 	}
 
 	if n, ok := extractSingleMap(m["resources"]); ok {

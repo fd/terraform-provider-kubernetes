@@ -11,7 +11,10 @@ import (
 	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/errors"
 	"k8s.io/kubernetes/pkg/api/resource"
+	"k8s.io/kubernetes/pkg/client/unversioned"
+	"k8s.io/kubernetes/pkg/labels"
 	"k8s.io/kubernetes/pkg/util/intstr"
+	"k8s.io/kubernetes/pkg/util/wait"
 )
 
 var portResourceSpec = &schema.Resource{
@@ -1122,35 +1125,19 @@ func resourceControllerUpdate(r *schema.ResourceData, v interface{}) error {
 			replacement *api.ReplicationController
 		)
 
-		// wait until step is done
-		stepDone := false
-		for !stepDone {
-			originalStepDone := false
-			replacementStepDone := false
+		original, err = rcs.Get(name)
+		if err != nil {
+			return err
+		}
+		replacement, err = rcs.Get(tmpRcName)
+		if err != nil {
+			return err
+		}
 
-			// get status of original RC
-			original, err = rcs.Get(name)
-			if err != nil {
-				return err
-			}
-			if original.Spec.Replicas == originalStep && original.Status.Replicas == originalStep {
-				originalStepDone = true
-			}
-
-			// get status of replacement RC
-			replacement, err = rcs.Get(tmpRcName)
-			if err != nil {
-				return err
-			}
-			if replacement.Spec.Replicas == replacementStep && replacement.Status.Replicas == replacementStep {
-				replacementStepDone = true
-			}
-
-			if originalStepDone && replacementStepDone {
-				stepDone = true
-			}
-
-			time.Sleep(1 * time.Second)
+		cond := crossScaled(client, original, replacement, 30*time.Second)
+		err := wait.Poll(1*time.Second, 2*time.Minute, cond)
+		if err != nil {
+			return err
 		}
 
 		{ // are we done
@@ -1184,8 +1171,6 @@ func resourceControllerUpdate(r *schema.ResourceData, v interface{}) error {
 				if err != nil {
 					return err
 				}
-
-				time.Sleep(30 * time.Second)
 			}
 		} else {
 			scaleReplacement = !scaleReplacement
@@ -1727,5 +1712,94 @@ func writeProbe(m map[string]interface{}, item *api.Probe) {
 		if x, ok := n["port"].(int); ok {
 			item.TCPSocket.Port = intstr.FromInt(x)
 		}
+	}
+}
+
+func crossScaled(c unversioned.Interface, oldRC, newRC *api.ReplicationController, settleDuration time.Duration) wait.ConditionFunc {
+	oldRCReady := unversioned.ControllerHasDesiredReplicas(c, oldRC)
+	newRCReady := unversioned.ControllerHasDesiredReplicas(c, newRC)
+	oldRCPodsReady := desiredPodsAreReady(c, oldRC, settleDuration)
+	newRCPodsReady := desiredPodsAreReady(c, newRC, settleDuration)
+	return func() (done bool, err error) {
+
+		if ok, err := oldRCReady(); err != nil || !ok {
+			return ok, err
+		}
+
+		if ok, err := newRCReady(); err != nil || !ok {
+			return ok, err
+		}
+		if ok, err := oldRCPodsReady(); err != nil || !ok {
+			return ok, err
+		}
+
+		if ok, err := newRCPodsReady(); err != nil || !ok {
+			return ok, err
+		}
+
+		return true, nil
+	}
+}
+
+func scaled(c unversioned.Interface, rc *api.ReplicationController, settleDuration time.Duration) wait.ConditionFunc {
+	rcReady := unversioned.ControllerHasDesiredReplicas(c, rc)
+	rcPodsReady := desiredPodsAreReady(c, rc, settleDuration)
+	return func() (done bool, err error) {
+
+		if ok, err := rcReady(); err != nil || !ok {
+			return ok, err
+		}
+
+		if ok, err := rcPodsReady(); err != nil || !ok {
+			return ok, err
+		}
+
+		return true, nil
+	}
+}
+
+func desiredPodsAreReady(c unversioned.Interface, rc *api.ReplicationController, settleDuration time.Duration) wait.ConditionFunc {
+	return func() (done bool, err error) {
+		selector := labels.Set(rc.Spec.Selector).AsSelector()
+		options := api.ListOptions{LabelSelector: selector}
+		pods, err := c.Pods(rc.Namespace).List(options)
+		if err != nil {
+			return false, err
+		}
+
+		var ready = 0
+		var nonReady = 0
+
+		for _, pod := range pods.Items {
+			if !api.IsPodReady(&pod) {
+				nonReady++
+				continue
+			}
+			if len(pod.Status.ContainerStatuses) == 0 {
+				continue
+			}
+
+			now := time.Now()
+			var readyContainers = 0
+			for _, c := range pod.Status.ContainerStatuses {
+				if !c.Ready {
+					continue
+				}
+				if c.State.Running == nil {
+					continue
+				}
+				if c.State.Running.StartedAt.After(now.Add(-settleDuration)) {
+					continue
+				}
+				readyContainers++
+			}
+			if readyContainers != len(pod.Spec.Containers) {
+				continue
+			}
+
+			ready++
+		}
+
+		return ready == rc.Spec.Replicas && nonReady == 0, nil
 	}
 }
